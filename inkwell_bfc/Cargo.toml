@@ -1,0 +1,9 @@
+[package]
+name = "inkwell_bfc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.82"
+inkwell = { version = "0.4.0", features = [ "llvm16-0" ] }
+lazy_static = "1.4.0"
