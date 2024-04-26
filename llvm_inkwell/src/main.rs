@@ -1,13 +1,28 @@
+use std::path::{Path, PathBuf};
+use inkwell::targets::{Target, TargetTriple};
+
+use clap::Parser;
+
+#[derive(Parser)]
+struct Args {
+    /// The target triple to compile for (e.g. x86_64-pc-linux-gnu, x86_64-pc-windows-msvc).
+    /// If not specified, the module will be output as LLVM IR
+    #[clap(short, long)]
+    target: Option<String>,
+
+    /// Optimization level
+    #[clap(short, long)]
+    opt: Option<String>,
+
+    /// The input file to compile
+    #[clap()]
+    input: PathBuf,
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
-
-    if args.len() != 2 {
-        eprintln!("Usage: inkwell_bfc <file>");
-        std::process::exit(1);
-    }
-
-    let file = std::fs::read_to_string(&args[1]).unwrap();
+    let args = Args::parse();
+    let file = std::fs::read_to_string(&args.input)?;
+    let module_name = args.input.file_stem().unwrap().to_str().unwrap();
 
     let content = file
         .chars()
@@ -27,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = inkwell::context::Context::create();
     let i8_type = context.i8_type();
 
-    let module = context.create_module("bfc");
+    let module = context.create_module(module_name);
     let builder = context.create_builder();
 
     let putchar_type = context.i32_type().fn_type(&[i8_type.into()], false);
@@ -58,14 +73,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match c.as_str() {
             s if s.starts_with('+') => {
                 let i = builder.build_load(i64_type, tape_pointer, "i")?.into_int_value();
-                let cell = get_pointer_to_array_index(&context, &builder, memory, i)?;
+                let cell = unsafe { builder.build_gep(i8_type, memory, &[i], "ptr")? };
                 let value = builder.build_load(i8_type, cell, "value")?;
                 let value = builder.build_int_add(value.into_int_value(), i8_type.const_int(s.len() as u64, false), "value")?;
                 builder.build_store(cell, value)?;
             },
             s if s.starts_with('-') => {
                 let i = builder.build_load(i64_type, tape_pointer, "i")?.into_int_value();
-                let cell = get_pointer_to_array_index(&context, &builder, memory, i)?;
+                let cell = unsafe { builder.build_gep(i8_type, memory, &[i], "ptr")? };
                 let value = builder.build_load(i8_type, cell, "value")?;
                 let value = builder.build_int_sub(value.into_int_value(), i8_type.const_int(s.len() as u64, false), "value")?;
                 builder.build_store(cell, value)?;
@@ -86,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let i = builder.build_load(i64_type, tape_pointer, "i")?.into_int_value();
 
-                let cell = get_pointer_to_array_index(&context, &builder, memory, i)?;
+                let cell = unsafe { builder.build_gep(i8_type, memory, &[i], "ptr")? };
                 let value = builder.build_load(i8_type, cell, "value")?;
                 let cond = builder.build_int_compare(inkwell::IntPredicate::EQ, value.into_int_value(), i8_type.const_int(0, false), "cond")?;
                 builder.build_conditional_branch(cond, loop_end, loop_start)?;
@@ -99,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let i = builder.build_load(i64_type, tape_pointer, "i")?.into_int_value();
 
-                let cell = get_pointer_to_array_index(&context, &builder, memory, i)?;
+                let cell = unsafe { builder.build_gep(i8_type, memory, &[i], "ptr")? };
                 let value = builder.build_load(i8_type, cell, "value")?;
                 let cond = builder.build_int_compare(inkwell::IntPredicate::NE, value.into_int_value(), i8_type.const_int(0, false), "cond")?;
                 builder.build_conditional_branch(cond, loop_start, loop_end)?;
@@ -108,13 +123,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             "." => {
                 let i = builder.build_load(i64_type, tape_pointer, "i")?.into_int_value();
-                let cell = get_pointer_to_array_index(&context, &builder, memory, i)?;
+                let cell = unsafe { builder.build_gep(i8_type, memory, &[i], "ptr")? };
                 let value = builder.build_load(i8_type, cell, "value")?;
                 builder.build_call(putchar_func, &[value.into()], "putchar")?;
             },
             "," => {
                 let i = builder.build_load(i64_type, tape_pointer, "i")?.into_int_value();
-                let cell = get_pointer_to_array_index(&context, &builder, memory, i)?;
+                let cell = unsafe { builder.build_gep(i8_type, memory, &[i], "ptr")? };
                 let value = builder.build_call(getchar_func, &[], "getchar")?.try_as_basic_value().left().unwrap();
                 builder.build_store(cell, value)?;
             },
@@ -122,21 +137,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    builder.build_free(memory)?;
     builder.build_return(Some(&i8_type.const_int(0, false)))?;
-    let s = module.print_to_string().to_string();
 
-    println!("{}", s);
+    Target::initialize_all(&inkwell::targets::InitializationConfig::default());
+    
+    let opt = match args.opt.as_deref() {
+        Some("0") => inkwell::OptimizationLevel::None,
+        Some("1") => inkwell::OptimizationLevel::Less,
+        Some("2") => inkwell::OptimizationLevel::Default,
+        Some("3") => inkwell::OptimizationLevel::Aggressive,
+        _ => {
+            println!("Optimization level invalid or not specified, defaulting to --opt 2");
+            inkwell::OptimizationLevel::Default
+        }
+    };
+    let reloc = inkwell::targets::RelocMode::Default;
+    let code_model = inkwell::targets::CodeModel::Default;
+
+    if let Some(triple_str) = args.target {
+        println!("Compiling for target: {}", triple_str);
+        let triple = TargetTriple::create(&triple_str);
+        let target = Target::from_triple(&triple)
+            .map_err(|e| format!("could not create target: {}", e))?; 
+
+        let arch = triple_str
+            .split('-')
+            .next().unwrap()
+            .replace("_", "-");
+
+        let target_machine = target.create_target_machine(
+            &triple,
+            &arch,
+            "",
+            opt,
+            reloc,
+            code_model,
+        ).ok_or(format!("could not create target machine for target: {}", triple_str))?;
+
+        let output = Path::new(module_name).with_extension("o");
+        target_machine.write_to_file(&module, inkwell::targets::FileType::Object, &output)
+            .map_err(|e| format!("could not write object file: {}", e))?;
+
+        println!("Wrote module to object file: {}", output.display());
+        return Ok(());
+    }
+
+    let output = Path::new(module_name).with_extension("ll");
+    module.print_to_file(&output)
+        .map_err(|e| format!("could not write LLVM IR file: {}", e))?;
+
+    println!("Wrote module to LLVM IR file: {}", output.display());
 
     Ok(())
-}
-
-fn get_pointer_to_array_index<'a>(
-    context: &'a inkwell::context::Context,
-    builder: &'a inkwell::builder::Builder,
-    array: inkwell::values::PointerValue<'a>,
-    index: inkwell::values::IntValue<'a>,
-) -> Result<inkwell::values::PointerValue<'a>, inkwell::builder::BuilderError> {
-    unsafe {
-        builder.build_gep(context.i8_type(), array, &[index], "ptr")
-    }
 }
